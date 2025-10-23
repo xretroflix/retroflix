@@ -876,23 +876,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-```
-
----
-
-## **📋 DEPLOYMENT STEPS**
-
-### **1. Replace in GitHub/Replit:**
-- Delete ALL old code
-- Copy-paste this entire code
-- Save
-
-### **2. In Replit:**
-- Click "Stop"
-- Click "Run"
-
-### **3. Should see:**
-```
-🚀 Starting bot...
-✅ Settings: Photo=False, Age=15, Expiry=5min
-🔒 Bot running 24/7
