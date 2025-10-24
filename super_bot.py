@@ -557,6 +557,8 @@ async def set_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        global POSTING_INTERVAL_HOURS
+    
     if update.effective_user.id != ADMIN_ID:
         return
     
@@ -570,8 +572,6 @@ async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
         return
-    
-    global POSTING_INTERVAL_HOURS
     
     try:
         interval = float(context.args[0])
