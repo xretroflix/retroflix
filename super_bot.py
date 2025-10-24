@@ -34,8 +34,12 @@ AUTO_POST_ENABLED = {}
 POSTING_INTERVAL_HOURS = 1
 
 # User database
-USER_DATABASE = {}  # {user_id: {details, channels: {channel_id: status}}}
+USER_DATABASE = {}
 USER_ACTIVITY_LOG = []
+
+# Default caption
+DEFAULT_CAPTION = ""  # Empty by default
+CHANNEL_DEFAULT_CAPTIONS = {}  # {channel_id: "caption"}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -74,9 +78,7 @@ async def check_user_legitimacy(context: ContextTypes.DEFAULT_TYPE, user_id: int
     except:
         return {"legitimate": False, "reason": "Error", "score": 0}
 
-# USER TRACKING
 def track_user_activity(user_id: int, channel_id: int, action: str, user_data: dict = None):
-    """Track all user activities"""
     if user_id not in USER_DATABASE:
         USER_DATABASE[user_id] = {
             'first_name': user_data.get('first_name', 'Unknown') if user_data else 'Unknown',
@@ -84,7 +86,6 @@ def track_user_activity(user_id: int, channel_id: int, action: str, user_data: d
             'username': user_data.get('username', ''),
             'channels': {}
         }
-    
     if channel_id not in USER_DATABASE[user_id]['channels']:
         USER_DATABASE[user_id]['channels'][channel_id] = {
             'channel_name': MANAGED_CHANNELS.get(channel_id, {}).get('name', 'Unknown'),
@@ -97,7 +98,6 @@ def track_user_activity(user_id: int, channel_id: int, action: str, user_data: d
         USER_DATABASE[user_id]['channels'][channel_id]['status'] = action
         if action == 'approved':
             USER_DATABASE[user_id]['channels'][channel_id]['approval_date'] = datetime.now()
-    
     USER_ACTIVITY_LOG.append({
         'timestamp': datetime.now(),
         'user_id': user_id,
@@ -106,26 +106,20 @@ def track_user_activity(user_id: int, channel_id: int, action: str, user_data: d
     })
 
 async def export_users_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Export user database as CSV"""
     if update.effective_user.id != ADMIN_ID:
         return
-    
     channel_filter = None
     if context.args:
         try:
             channel_filter = int(context.args[0])
         except:
             pass
-    
     msg = await update.message.reply_text("⏳ Generating report...")
-    
     csv_lines = ["User ID,First Name,Last Name,Username,Channel Name,Channel ID,Status,Request Date,Approval Date\n"]
-    
     for user_id, user_data in USER_DATABASE.items():
         for channel_id, channel_data in user_data['channels'].items():
             if channel_filter and channel_id != channel_filter:
                 continue
-            
             csv_lines.append(
                 f"{user_id},"
                 f'"{user_data["first_name"]}",'
@@ -137,17 +131,13 @@ async def export_users_report(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"{channel_data['request_date'].strftime('%Y-%m-%d %H:%M')},"
                 f"{channel_data['approval_date'].strftime('%Y-%m-%d %H:%M') if channel_data['approval_date'] else 'N/A'}\n"
             )
-    
     if len(csv_lines) == 1:
         await msg.edit_text("❌ No user data to export")
         return
-    
     csv_content = ''.join(csv_lines)
     filename = f"user_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    
     file_data = BytesIO(csv_content.encode('utf-8-sig'))
     file_data.name = filename
-    
     await context.bot.send_document(
         chat_id=ADMIN_ID,
         document=file_data,
@@ -155,15 +145,11 @@ async def export_users_report(update: Update, context: ContextTypes.DEFAULT_TYPE
         caption=f"📊 *User Report*\n\nTotal Users: {len(USER_DATABASE)}\nTotal Records: {len(csv_lines)-1}",
         parse_mode='Markdown'
     )
-    
     await msg.delete()
 
 async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE):
-    """Send weekly user report automatically"""
     logger.info("Generating weekly user report...")
-    
     csv_lines = ["User ID,First Name,Last Name,Username,Channel Name,Channel ID,Status,Request Date,Approval Date\n"]
-    
     for user_id, user_data in USER_DATABASE.items():
         for channel_id, channel_data in user_data['channels'].items():
             csv_lines.append(
@@ -177,14 +163,11 @@ async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE):
                 f"{channel_data['request_date'].strftime('%Y-%m-%d %H:%M')},"
                 f"{channel_data['approval_date'].strftime('%Y-%m-%d %H:%M') if channel_data['approval_date'] else 'N/A'}\n"
             )
-    
     if len(csv_lines) > 1:
         csv_content = ''.join(csv_lines)
         filename = f"weekly_report_{datetime.now().strftime('%Y%m%d')}.csv"
-        
         file_data = BytesIO(csv_content.encode('utf-8-sig'))
         file_data.name = filename
-        
         try:
             await context.bot.send_document(
                 chat_id=ADMIN_ID,
@@ -197,17 +180,13 @@ async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Failed to send weekly report: {e}")
 
 async def user_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user statistics per channel"""
     if update.effective_user.id != ADMIN_ID:
         return
-    
     text = "📊 *User Statistics*\n\n"
-    
     for channel_id, channel_data in MANAGED_CHANNELS.items():
         pending = 0
         approved = 0
         rejected = 0
-        
         for user_id, user_data in USER_DATABASE.items():
             if channel_id in user_data['channels']:
                 status = user_data['channels'][channel_id]['status']
@@ -217,93 +196,67 @@ async def user_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     approved += 1
                 elif status == 'rejected':
                     rejected += 1
-        
         text += (
             f"*{channel_data['name']}*\n"
             f"✅ Approved: {approved}\n"
             f"⏳ Pending: {pending}\n"
             f"❌ Rejected: {rejected}\n\n"
         )
-    
     text += f"📁 *Total Unique Users:* {len(USER_DATABASE)}"
-    
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def import_users_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Import all tracked users to a new channel"""
     if update.effective_user.id != ADMIN_ID:
         return
-    
     if not context.args:
         await update.message.reply_text(
-            "📥 *Import Users to Channel*\n\n"
+            "📥 *Import Users*\n\n"
             "*Usage:*\n"
             "`/import_users TARGET_CHANNEL_ID`\n"
             "or\n"
             "`/import_users TARGET_CHANNEL_ID SOURCE_CHANNEL_ID`\n\n"
             "*Examples:*\n"
             "`/import_users -1001234567890` - Import ALL users\n"
-            "`/import_users -1001234567890 -1009876543210` - Import from specific channel\n\n"
-            "*Note:* Only imports approved users",
+            "`/import_users -1001234567890 -1009876543210` - Import from specific channel",
             parse_mode='Markdown'
         )
         return
-    
     try:
         target_channel_id = int(context.args[0])
         source_channel_id = int(context.args[1]) if len(context.args) > 1 else None
-        
         if target_channel_id not in MANAGED_CHANNELS:
-            await update.message.reply_text("❌ Target channel not found. Add it first with /addchannel")
+            await update.message.reply_text("❌ Target channel not found")
             return
-        
-        # Check if bot has invite permission
         if not await is_bot_admin(context, target_channel_id):
             await update.message.reply_text("❌ Bot must be admin in target channel")
             return
-        
-        # Get invite link
         try:
             invite_link = await context.bot.export_chat_invite_link(target_channel_id)
         except:
-            await update.message.reply_text("❌ Cannot create invite link. Check bot permissions.")
+            await update.message.reply_text("❌ Cannot create invite link")
             return
-        
-        # Collect users to import
         users_to_import = []
-        
         for user_id, user_data in USER_DATABASE.items():
-            # Skip blocked users
             if user_id in BLOCKED_USERS:
                 continue
-            
-            # Skip if already in target channel
             if target_channel_id in user_data['channels']:
                 continue
-            
-            # Filter by source channel if specified
             if source_channel_id:
                 if source_channel_id in user_data['channels'] and user_data['channels'][source_channel_id]['status'] == 'approved':
                     users_to_import.append(user_id)
             else:
-                # Import all approved users from any channel
                 has_approved = any(ch['status'] == 'approved' for ch in user_data['channels'].values())
                 if has_approved:
                     users_to_import.append(user_id)
-        
         if not users_to_import:
             await update.message.reply_text("📭 No users to import")
             return
-        
         msg = await update.message.reply_text(f"⏳ Importing {len(users_to_import)} users...")
-        
         success = 0
         failed = 0
         already_member = 0
-        
         for user_id in users_to_import:
             try:
-                # Check if user is already a member
                 try:
                     member = await context.bot.get_chat_member(target_channel_id, user_id)
                     if member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
@@ -311,99 +264,167 @@ async def import_users_to_channel(update: Update, context: ContextTypes.DEFAULT_
                         continue
                 except:
                     pass
-                
-                # Send invite link to user
                 try:
                     await context.bot.send_message(
                         user_id,
-                        f"🎉 *You're invited!*\n\n"
-                        f"Join: *{MANAGED_CHANNELS[target_channel_id]['name']}*\n\n"
-                        f"Click to join: {invite_link}",
+                        f"🎉 *You're invited!*\n\nJoin: *{MANAGED_CHANNELS[target_channel_id]['name']}*\n\n{invite_link}",
                         parse_mode='Markdown'
                     )
                     success += 1
-                    
-                    # Track this user for new channel
                     user_info = USER_DATABASE[user_id]
                     track_user_activity(user_id, target_channel_id, 'invited', {
                         'first_name': user_info['first_name'],
                         'last_name': user_info['last_name'],
                         'username': user_info['username']
                     })
-                    
-                except Exception as e:
+                except:
                     failed += 1
-                    logger.error(f"Failed to send invite to {user_id}: {e}")
-                
-                # Update progress every 50 users
                 if (success + failed) % 50 == 0:
-                    await msg.edit_text(
-                        f"⏳ Progress: {success + failed}/{len(users_to_import)}\n"
-                        f"✅ Sent: {success}\n"
-                        f"❌ Failed: {failed}"
-                    )
-                
+                    await msg.edit_text(f"⏳ Progress: {success + failed}/{len(users_to_import)}\n✅ Sent: {success}\n❌ Failed: {failed}")
                 await asyncio.sleep(0.1)
-                
-            except Exception as e:
+            except:
                 failed += 1
-                logger.error(f"Error importing user {user_id}: {e}")
-        
         await msg.edit_text(
             f"✅ *Import Complete!*\n\n"
             f"Target: {MANAGED_CHANNELS[target_channel_id]['name']}\n"
             f"Total: {len(users_to_import)}\n"
             f"✅ Invited: {success}\n"
             f"👥 Already member: {already_member}\n"
-            f"❌ Failed: {failed}\n\n"
-            f"*Note:* Users received invite links. They need to join manually.",
+            f"❌ Failed: {failed}",
             parse_mode='Markdown'
         )
-        
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
+
+# DEFAULT CAPTION COMMANDS
+async def set_default_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global DEFAULT_CAPTION
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        current = DEFAULT_CAPTION if DEFAULT_CAPTION else "None"
+        await update.message.reply_text(
+            f"📝 *Default Caption*\n\n"
+            f"Current: {current}\n\n"
+            f"*Set caption:*\n"
+            f"`/set_default_caption Your caption here`\n\n"
+            f"*Clear caption:*\n"
+            f"`/clear_default_caption`\n\n"
+            f"*Per-channel caption:*\n"
+            f"`/set_channel_caption CHANNEL_ID Caption here`",
+            parse_mode='Markdown'
+        )
+        return
+    caption = " ".join(context.args)
+    DEFAULT_CAPTION = caption
+    await update.message.reply_text(
+        f"✅ *Default Caption Set!*\n\n"
+        f"{caption}\n\n"
+        f"This will apply to ALL images without their own caption",
+        parse_mode='Markdown'
+    )
+
+async def clear_default_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global DEFAULT_CAPTION
+    if update.effective_user.id != ADMIN_ID:
+        return
+    DEFAULT_CAPTION = ""
+    await update.message.reply_text("🗑️ *Default caption cleared*", parse_mode='Markdown')
+
+async def set_channel_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args or len(context.args) < 2:
+        text = "📝 *Set Channel-Specific Caption*\n\n"
+        text += "*Usage:*\n`/set_channel_caption CHANNEL_ID Caption text`\n\n"
+        if CHANNEL_DEFAULT_CAPTIONS:
+            text += "*Current channel captions:*\n"
+            for ch_id, cap in CHANNEL_DEFAULT_CAPTIONS.items():
+                ch_name = MANAGED_CHANNELS.get(ch_id, {}).get('name', 'Unknown')
+                text += f"• {ch_name}: {cap[:50]}...\n"
+        await update.message.reply_text(text, parse_mode='Markdown')
+        return
+    try:
+        channel_id = int(context.args[0])
+        if channel_id not in MANAGED_CHANNELS:
+            await update.message.reply_text("❌ Channel not found")
+            return
+        caption = " ".join(context.args[1:])
+        CHANNEL_DEFAULT_CAPTIONS[channel_id] = caption
+        await update.message.reply_text(
+            f"✅ *Channel Caption Set!*\n\n"
+            f"Channel: {MANAGED_CHANNELS[channel_id]['name']}\n"
+            f"Caption: {caption}",
+            parse_mode='Markdown'
+        )
+    except:
+        await update.message.reply_text("❌ Invalid channel ID")
+
+async def clear_channel_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/clear_channel_caption CHANNEL_ID`", parse_mode='Markdown')
+        return
+    try:
+        channel_id = int(context.args[0])
+        if channel_id in CHANNEL_DEFAULT_CAPTIONS:
+            del CHANNEL_DEFAULT_CAPTIONS[channel_id]
+            await update.message.reply_text("🗑️ *Channel caption cleared*", parse_mode='Markdown')
+        else:
+            await update.message.reply_text("❌ No caption set for this channel")
+    except:
+        await update.message.reply_text("❌ Invalid channel ID")
 
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE, channel_id: int):
     if not AUTO_POST_ENABLED.get(channel_id):
         return
-    
     if channel_id in CHANNEL_SPECIFIC_IMAGES and CHANNEL_SPECIFIC_IMAGES[channel_id]:
         images = CHANNEL_SPECIFIC_IMAGES[channel_id]
     elif UPLOADED_IMAGES:
         images = UPLOADED_IMAGES
     else:
         return
-    
     if channel_id not in CURRENT_IMAGE_INDEX:
         CURRENT_IMAGE_INDEX[channel_id] = 0
-    
     idx = CURRENT_IMAGE_INDEX[channel_id]
     image = images[idx]
+    
+    # Determine caption to use (priority order)
+    # 1. Image's own caption
+    # 2. Channel-specific default caption
+    # 3. Global default caption
+    # 4. Empty caption
+    if image.get('caption'):
+        final_caption = image['caption']
+    elif channel_id in CHANNEL_DEFAULT_CAPTIONS:
+        final_caption = CHANNEL_DEFAULT_CAPTIONS[channel_id]
+    elif DEFAULT_CAPTION:
+        final_caption = DEFAULT_CAPTION
+    else:
+        final_caption = ""
     
     try:
         await context.bot.send_photo(
             chat_id=channel_id,
             photo=image['file_id'],
-            caption=image.get('caption', '')
+            caption=final_caption
         )
-        logger.info(f"Posted to {channel_id}")
+        logger.info(f"Posted to {channel_id} with caption: {final_caption[:30]}...")
         CURRENT_IMAGE_INDEX[channel_id] = (idx + 1) % len(images)
     except Exception as e:
         logger.error(f"Post failed: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
     if user_id == ADMIN_ID:
         VERIFIED_USERS.add(user_id)
-        
         settings_text = (
             f"Age: {MIN_ACCOUNT_AGE_DAYS} days\n"
             f"Photo: {'Required' if REQUIRE_PROFILE_PHOTO else 'Optional'}\n"
             f"Code: {CODE_EXPIRY_MINUTES} mins\n"
             f"Name: Strict"
         )
-        
         await update.message.reply_text(
             "🎯 *SUPER BOT - ADMIN PANEL*\n\n"
             "*📢 Channel:*\n"
@@ -424,23 +445,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/upload\\_for\\_channel CHANNEL\\_ID\n"
             "/list\\_images - View images\n"
             "/clear\\_images - Clear images\n\n"
+            "*📝 Captions:*\n"
+            "/set\\_default\\_caption TEXT - Set for all\n"
+            "/set\\_channel\\_caption CH\\_ID TEXT - Set per channel\n"
+            "/clear\\_default\\_caption - Clear default\n"
+            "/clear\\_channel\\_caption CH\\_ID - Clear channel caption\n\n"
             "*🤖 Auto-Posting:*\n"
             "/enable\\_autopost CHANNEL\\_ID\n"
             "/disable\\_autopost CHANNEL\\_ID\n"
             "/autopost\\_status - Status\n\n"
             "*📊 Reports & Import:*\n"
             "/export\\_users - Download report\n"
-            "/export\\_users CHANNEL\\_ID - Report for channel\n"
-            "/user\\_stats - Statistics per channel\n"
-            "/import\\_users TARGET\\_CH\\_ID - Import all users\n"
-            "/import\\_users TARGET SOURCE - Import from channel\n\n"
+            "/user\\_stats - Statistics\n"
+            "/import\\_users TARGET\\_CH\\_ID\n\n"
             "*📊 Stats:*\n"
             "/stats - Statistics\n\n"
             f"🔒 *Settings:*\n{settings_text}",
             parse_mode='Markdown'
         )
         return
-    
     keyboard = [[InlineKeyboardButton("🔐 Verify", callback_data=f"verify_{user_id}")]]
     await update.message.reply_text(
         f"🔒 *Verification Required*\n\nID: `{user_id}`\n\nClick to verify:",
@@ -461,19 +484,15 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.chat_join_request:
         return
-    
     user_id = update.chat_join_request.from_user.id
     channel_id = update.chat_join_request.chat.id
     channel_name = MANAGED_CHANNELS.get(channel_id, {}).get("name", "Unknown")
     user = update.chat_join_request.from_user
-    
-    # Track user activity
     track_user_activity(user_id, channel_id, 'pending', {
         'first_name': user.first_name,
         'last_name': user.last_name,
         'username': user.username
     })
-    
     if BULK_APPROVAL_MODE.get(channel_id, False):
         try:
             await context.bot.approve_chat_join_request(channel_id, user_id)
@@ -481,7 +500,6 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         except:
             return
-    
     if user_id in BLOCKED_USERS:
         try:
             await context.bot.decline_chat_join_request(channel_id, user_id)
@@ -489,7 +507,6 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         except:
             pass
         return
-    
     legitimacy_check = await check_user_legitimacy(context, user_id)
     if not legitimacy_check["legitimate"]:
         try:
@@ -498,7 +515,6 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         except:
             pass
         return
-    
     verification_code = generate_verification_code()
     PENDING_VERIFICATIONS[user_id] = {
         'channel_id': channel_id,
@@ -508,7 +524,6 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         'attempts': 0,
         'max_attempts': 3
     }
-    
     try:
         keyboard = [
             [InlineKeyboardButton("✅ Enter Code", callback_data=f"enter_code_{user_id}")],
@@ -516,8 +531,7 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]
         await context.bot.send_message(
             user_id,
-            f"🔐 *Verification Required*\n\nChannel: *{channel_name}*\n\n"
-            f"Code:\n```\n{verification_code}\n```\n\n⏱️ {CODE_EXPIRY_MINUTES} mins",
+            f"🔐 *Verification Required*\n\nChannel: *{channel_name}*\n\nCode:\n```\n{verification_code}\n```\n\n⏱️ {CODE_EXPIRY_MINUTES} mins",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
@@ -558,17 +572,13 @@ async def resend_code_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_verification_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('awaiting_code'):
         return
-    
     user_id = update.effective_user.id
     submitted_code = update.message.text.strip().upper()
-    
     if user_id not in PENDING_VERIFICATIONS:
         await update.message.reply_text("❌ No pending verification")
         context.user_data['awaiting_code'] = False
         return
-    
     verification = PENDING_VERIFICATIONS[user_id]
-    
     if (datetime.now() - verification['timestamp']).seconds > (CODE_EXPIRY_MINUTES * 60):
         del PENDING_VERIFICATIONS[user_id]
         context.user_data['awaiting_code'] = False
@@ -579,18 +589,13 @@ async def handle_verification_code(update: Update, context: ContextTypes.DEFAULT
         except:
             pass
         return
-    
     verification['attempts'] += 1
-    
     if submitted_code == verification['code']:
         context.user_data['awaiting_code'] = False
         try:
             await context.bot.approve_chat_join_request(verification['channel_id'], user_id)
             track_user_activity(user_id, verification['channel_id'], 'approved')
-            await update.message.reply_text(
-                f"✅ *Verified!*\n\nWelcome to *{verification['channel_name']}*! 🎉",
-                parse_mode='Markdown'
-            )
+            await update.message.reply_text(f"✅ *Verified!*\n\nWelcome to *{verification['channel_name']}*! 🎉", parse_mode='Markdown')
             if user_id not in VERIFIED_FOR_CHANNELS:
                 VERIFIED_FOR_CHANNELS[user_id] = []
             VERIFIED_FOR_CHANNELS[user_id].append(verification['channel_id'])
@@ -616,7 +621,8 @@ async def upload_images_command(update: Update, context: ContextTypes.DEFAULT_TY
     if update.effective_user.id != ADMIN_ID:
         return
     await update.message.reply_text(
-        "📤 *Upload Images*\n\nSend photos with captions\n\nPosted to ALL channels unless you use /upload\\_for\\_channel",
+        "📤 *Upload Images*\n\nSend photos (with or without captions)\n\n"
+        "If no caption, default caption will be used",
         parse_mode='Markdown'
     )
     context.user_data['uploading_mode'] = 'general'
@@ -669,6 +675,7 @@ async def list_images(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for channel_id, images in CHANNEL_SPECIFIC_IMAGES.items():
         channel_name = MANAGED_CHANNELS.get(channel_id, {}).get('name', 'Unknown')
         text += f"📢 {channel_name}: {len(images)} images\n"
+    text += f"\n*Default Caption:* {DEFAULT_CAPTION if DEFAULT_CAPTION else 'None'}"
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def clear_images(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -733,7 +740,20 @@ async def autopost_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             image_count = len(UPLOADED_IMAGES)
         current_idx = CURRENT_IMAGE_INDEX.get(channel_id, 0)
-        text += f"*{data['name']}*\n{status} | {image_count} images | Next: #{current_idx+1}\n\n"
+        
+        # Show caption info
+        if channel_id in CHANNEL_DEFAULT_CAPTIONS:
+            caption_info = f"Caption: Channel-specific"
+        elif DEFAULT_CAPTION:
+            caption_info = f"Caption: Default"
+        else:
+            caption_info = "Caption: From images"
+        
+        text += f"*{data['name']}*\n{status} | {image_count} images | Next: #{current_idx+1}\n{caption_info}\n\n"
+    
+    if DEFAULT_CAPTION:
+        text += f"\n📝 *Default Caption:*\n{DEFAULT_CAPTION[:100]}..."
+    
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def pending_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1045,6 +1065,10 @@ def main():
     app.add_handler(CommandHandler("upload_for_channel", upload_for_channel_command))
     app.add_handler(CommandHandler("list_images", list_images))
     app.add_handler(CommandHandler("clear_images", clear_images))
+    app.add_handler(CommandHandler("set_default_caption", set_default_caption))
+    app.add_handler(CommandHandler("clear_default_caption", clear_default_caption))
+    app.add_handler(CommandHandler("set_channel_caption", set_channel_caption))
+    app.add_handler(CommandHandler("clear_channel_caption", clear_channel_caption))
     app.add_handler(CommandHandler("enable_autopost", enable_autopost))
     app.add_handler(CommandHandler("disable_autopost", disable_autopost))
     app.add_handler(CommandHandler("autopost_status", autopost_status))
@@ -1066,17 +1090,9 @@ def main():
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
     
     scheduler.start()
+    scheduler.add_job(weekly_report_job, trigger=CronTrigger(day_of_week='mon', hour=9), args=[app.bot], id='weekly_report')
     
-    # Schedule weekly report every Monday at 9 AM
-    scheduler.add_job(
-        weekly_report_job,
-        trigger=CronTrigger(day_of_week='mon', hour=9),
-        args=[app.bot],
-        id='weekly_report'
-    )
-    
-    logger.info(f"✅ Settings: Photo={REQUIRE_PROFILE_PHOTO}, Age={MIN_ACCOUNT_AGE_DAYS}")
-    logger.info("🔒 Bot running 24/7")
+    logger.info("✅ Bot running 24/7")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
