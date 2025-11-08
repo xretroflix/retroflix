@@ -1,3 +1,11 @@
 python-telegram-bot==20.7
 APScheduler==3.10.4
-telegram
+
+**Procfile** (create this file):
+
+worker: python bot.py
+
+
+**runtime.txt** (create this file):
+
+python-3.11
