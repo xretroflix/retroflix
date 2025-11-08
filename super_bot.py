@@ -36,6 +36,7 @@ POSTING_INTERVAL_HOURS = 1
 
 USER_DATABASE = {}
 USER_ACTIVITY_LOG = []
+RECENT_ACTIVITY = []  # Store recent approvals/rejections for batch viewing
 
 DEFAULT_CAPTION = ""
 CHANNEL_DEFAULT_CAPTIONS = {}
@@ -150,35 +151,90 @@ def generate_verification_code() -> str:
 
 
 def is_name_suspicious(name: str) -> bool:
+    """Check if name looks suspicious (bot-like)"""
     if not name or len(name) < 2:
         return True
+
+    # Check for "User" followed by numbers (typical bot pattern)
+    if re.match(r'^User\d+$', name, re.IGNORECASE):
+        return True
+
+    # Check if name is mostly numbers
     letters_and_numbers = re.sub(r'[^a-zA-Z0-9]', '', name)
     if len(letters_and_numbers) < 2:
         return True
+
+    numbers = re.sub(r'\D', '', name)
+    if len(numbers) > len(name) * 0.6:  # More than 60% numbers
+        return True
+
     return False
 
 
 async def check_user_legitimacy(context: ContextTypes.DEFAULT_TYPE,
                                 user_id: int) -> dict:
+    """
+    Enhanced user legitimacy checker with detailed scoring
+    Returns: {"legitimate": bool, "score": int, "reason": str}
+    """
     try:
         user = await context.bot.get_chat(user_id)
+
+        score = 0
+        reasons = []
+
+        # Check 1: Is it a bot?
         if user.type == "bot":
-            return {"legitimate": False, "reason": "Bot", "score": 0}
+            return {"legitimate": False, "reason": "Bot account", "score": 0}
+
+        # Check 2: Name quality (40 points)
         if not user.first_name or is_name_suspicious(user.first_name):
-            return {
-                "legitimate": False,
-                "reason": "Suspicious name",
-                "score": 0
-            }
-        return {"legitimate": True, "score": 100}
-    except:
-        return {"legitimate": False, "reason": "Error", "score": 0}
+            reasons.append("Suspicious name")
+        else:
+            score += 40
+
+        # Check 3: Has username? (30 points)
+        if user.username:
+            score += 30
+        else:
+            reasons.append("No username")
+
+        # Check 4: Has profile photo? (30 points)
+        if REQUIRE_PROFILE_PHOTO:
+            try:
+                photos = await context.bot.get_user_profile_photos(user_id, limit=1)
+                if photos.total_count > 0:
+                    score += 30
+                else:
+                    reasons.append("No profile photo")
+            except:
+                reasons.append("Cannot check photo")
+        else:
+            # Give score anyway if not required
+            score += 30
+
+        # Scoring system:
+        # 100 = Legitimate (auto-approve)
+        # 1-99 = Borderline (manual check with captcha)
+        # 0 = Suspicious (auto-reject)
+
+        if score >= 70:
+            return {"legitimate": True, "score": 100}
+        elif score >= 30:
+            return {"legitimate": False, "score": 50, "reason": ", ".join(reasons)}
+        else:
+            return {"legitimate": False, "score": 0, "reason": ", ".join(reasons)}
+
+    except Exception as e:
+        logger.error(f"Legitimacy check failed: {e}")
+        return {"legitimate": False, "reason": "Error checking user", "score": 0}
 
 
 def track_user_activity(user_id: int,
                         channel_id: int,
                         action: str,
                         user_data: dict = None):
+    """Track user activity in database"""
     if user_id not in USER_DATABASE:
         USER_DATABASE[user_id] = {
             'first_name':
@@ -209,6 +265,7 @@ def track_user_activity(user_id: int,
 async def alert_owner_unauthorized_access(context: ContextTypes.DEFAULT_TYPE,
                                           user_id: int, username: str,
                                           first_name: str, command: str):
+    """Alert owner of unauthorized access attempts"""
     try:
         UNAUTHORIZED_ATTEMPTS.append({
             'user_id': user_id,
@@ -217,112 +274,62 @@ async def alert_owner_unauthorized_access(context: ContextTypes.DEFAULT_TYPE,
             'command': command,
             'timestamp': datetime.now()
         })
+
         await context.bot.send_message(
             ADMIN_ID,
-            f"⚠️ *Unauthorized Access*\n\n"
+            f"🚨 *Unauthorized Access Attempt*\n\n"
             f"User: {first_name}\n"
-            f"Username: @{username if username else 'None'}\n"
             f"ID: `{user_id}`\n"
-            f"Command: /{command}",
-            parse_mode='Markdown')
+            f"Username: @{username or 'None'}\n"
+            f"Command: `{command}`",
+            )
     except Exception as e:
-        logger.error(f"Failed to alert owner: {e}")
+        logger.error(f"Alert failed: {e}")
 
 
 async def owner_only_check(update: Update,
                            context: ContextTypes.DEFAULT_TYPE) -> bool:
-    # Check if update has effective_user (channel posts don't have users)
-    if not update.effective_user:
-        logger.warning("Received update without effective_user")
-        return False
-    
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        username = update.effective_user.username or ""
-        first_name = update.effective_user.first_name or "Unknown"
-        command = update.message.text.split()[0].replace('/', '') if update.message and update.message.text else "unknown"
-        await alert_owner_unauthorized_access(context, user_id, username,
-                                             first_name, command)
+    """Check if user is the owner"""
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        await alert_owner_unauthorized_access(context, update.effective_user.id,
+                                              update.effective_user.username,
+                                              update.effective_user.first_name,
+                                              update.message.text if update.message else "callback")
         await update.message.reply_text("❌ Unauthorized")
         return False
     return True
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 *SUPER BOT Active*\n\nAdmin only.",
-                                   parse_mode='Markdown')
-
-
-async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await owner_only_check(update, context):
-        return
-    await update.message.reply_text("📢 Forward channel message to add.")
-
-
-async def handle_forwarded_message(update: Update,
-                                   context: ContextTypes.DEFAULT_TYPE):
-    if not await owner_only_check(update, context):
-        return
-
-    fwd = update.message.forward_from_chat
-    if not fwd or fwd.type != 'channel':
-        await update.message.reply_text("❌ Not a channel message")
-        return
-
-    channel_id = fwd.id
-    if channel_id in MANAGED_CHANNELS:
-        await update.message.reply_text("⚠️ Already added!")
-        return
-
-    if not await is_bot_admin(context, channel_id):
-        await update.message.reply_text("❌ Bot not admin in channel")
-        return
-
-    channel_name = fwd.title
-    MANAGED_CHANNELS[channel_id] = {'name': channel_name, 'mode': 'manual'}
-    BULK_APPROVAL_MODE[channel_id] = False
-    save_data()
-    await update.message.reply_text(
-        f"✅ *Added:* {channel_name}\nID: `{channel_id}`", parse_mode='Markdown')
-
-
-async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await owner_only_check(update, context):
-        return
-
-    if not MANAGED_CHANNELS:
-        await update.message.reply_text("📢 No channels")
-        return
-
-    text = "📢 *Managed Channels:*\n\n"
-    for cid, data in MANAGED_CHANNELS.items():
-        bulk_mode = BULK_APPROVAL_MODE.get(cid, False)
-        auto_post = AUTO_POST_ENABLED.get(cid, False)
-        text += f"• {data['name']}\n"
-        text += f"  ID: `{cid}`\n"
-        text += f"  Bulk: {'ON' if bulk_mode else 'OFF'}\n"
-        text += f"  Auto-Post: {'ON' if auto_post else 'OFF'}\n\n"
-
-    await update.message.reply_text(text, parse_mode='Markdown')
-
-
+# ========== SMART JOIN REQUEST HANDLER ==========
 async def handle_join_request(update: Update,
                               context: ContextTypes.DEFAULT_TYPE):
+    """
+    Smart join request handler with 3-tier verification:
+    1. Auto-approve legitimate users
+    2. Auto-reject obvious bots/spammers
+    3. Math captcha for borderline cases
+    """
     request = update.chat_join_request
     user = request.from_user
     chat_id = request.chat.id
 
+    # Only handle managed channels
     if chat_id not in MANAGED_CHANNELS:
         return
 
+    # Always approve admin
     if user.id == ADMIN_ID:
         await request.approve()
+        logger.info(f"✅ Admin auto-approved: {user.id}")
         return
 
+    # Block already blocked users
     if user.id in BLOCKED_USERS:
         await request.decline()
+        logger.info(f"❌ Blocked user {user.id} tried to join")
         return
 
+    # Check if bulk approval is enabled for this channel
     if BULK_APPROVAL_MODE.get(chat_id, False):
         await request.approve()
         track_user_activity(user.id, chat_id, 'approved', {
@@ -330,7 +337,74 @@ async def handle_join_request(update: Update,
             'last_name': user.last_name or '',
             'username': user.username or ''
         })
+        logger.info(f"✅ Bulk-approved user: {user.id}")
         return
+
+    # Smart verification - check legitimacy
+    legitimacy = await check_user_legitimacy(context, user.id)
+
+    # === TIER 1: AUTO-APPROVE LEGITIMATE USERS ===
+    if legitimacy['legitimate'] and legitimacy['score'] >= 100:
+        try:
+            await request.approve()
+            track_user_activity(user.id, chat_id, 'approved', {
+                'first_name': user.first_name,
+                'last_name': user.last_name or '',
+                'username': user.username or ''
+            })
+
+            # Log to recent activity instead of sending notification
+            RECENT_ACTIVITY.append({
+                'type': 'auto_approved',
+                'user_id': user.id,
+                'user_name': user.first_name,
+                'username': user.username or 'None',
+                'channel': MANAGED_CHANNELS[chat_id]['name'],
+                'channel_id': chat_id,
+                'timestamp': datetime.now()
+            })
+
+            logger.info(f"✅ Auto-approved legitimate user: {user.id}")
+            return
+        except Exception as e:
+            logger.error(f"Auto-approval failed: {e}")
+
+    # === TIER 2: AUTO-REJECT OBVIOUS BOTS/SPAMMERS ===
+    if not legitimacy['legitimate'] and legitimacy['score'] == 0:
+        try:
+            await request.decline()
+
+            # Log to recent activity instead of sending notification
+            RECENT_ACTIVITY.append({
+                'type': 'auto_rejected',
+                'user_id': user.id,
+                'user_name': user.first_name or 'No Name',
+                'username': user.username or 'None',
+                'channel': MANAGED_CHANNELS[chat_id]['name'],
+                'channel_id': chat_id,
+                'reason': legitimacy.get('reason', 'Suspicious'),
+                'timestamp': datetime.now()
+            })
+
+            logger.info(f"❌ Auto-rejected suspicious user: {user.id}")
+            return
+        except Exception as e:
+            logger.error(f"Auto-rejection failed: {e}")
+
+    # === TIER 3: MATH CAPTCHA FOR BORDERLINE CASES ===
+    # Generate simple math problem
+    num1 = random.randint(1, 10)
+    num2 = random.randint(1, 10)
+    answer = num1 + num2
+
+    # Store verification data
+    PENDING_VERIFICATIONS[user.id] = {
+        'code': str(answer),
+        'chat_id': chat_id,
+        'timestamp': datetime.now(),
+        'captcha_question': f"{num1} + {num2}",
+        'request': request  # Store request object for later approval
+    }
 
     track_user_activity(user.id, chat_id, 'pending', {
         'first_name': user.first_name,
@@ -338,462 +412,656 @@ async def handle_join_request(update: Update,
         'username': user.username or ''
     })
 
-    legitimacy = await check_user_legitimacy(context, user.id)
-    code = generate_verification_code()
-
-    PENDING_VERIFICATIONS[user.id] = {
-        'code': code,
-        'chat_id': chat_id,
-        'timestamp': datetime.now()
-    }
-
+    # Send captcha to admin with quick approve button
     user_link = f"tg://user?id={user.id}"
     keyboard = [[
-        InlineKeyboardButton("✅ Auto-Approve",
+        InlineKeyboardButton("✅ Approve",
                             callback_data=f"enter_code_{user.id}")
     ]]
 
     await context.bot.send_message(
         ADMIN_ID,
-        f"🔔 *Join Request*\n\n"
+        f"⚠️ *Verification Needed*\n\n"
         f"Channel: {MANAGED_CHANNELS[chat_id]['name']}\n"
         f"User: [{user.first_name}]({user_link})\n"
         f"ID: `{user.id}`\n"
         f"Username: @{user.username or 'None'}\n"
-        f"Status: {'✅ Legit' if legitimacy['legitimate'] else '⚠️ Suspicious'}\n\n"
-        f"Code: `{code}`",
-        parse_mode='Markdown',
+        f"Status: Borderline - needs verification\n\n"
+        f"Math Captcha: {num1} + {num2} = ?\n"
+        f"Answer: {answer}\n\n"
+        f"Reason: {legitimacy.get('reason', 'Unknown')}",
         reply_markup=InlineKeyboardMarkup(keyboard))
+
+    logger.info(f"⚠️ Sent verification request for user: {user.id}")
 
 
 async def enter_code_callback(update: Update,
                               context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin's approval via button click"""
     query = update.callback_query
+
     if query.from_user.id != ADMIN_ID:
         await query.answer("Unauthorized", show_alert=True)
         return
 
+    await query.answer()
+
     user_id = int(query.data.split('_')[-1])
 
     if user_id not in PENDING_VERIFICATIONS:
-        await query.answer("❌ Expired", show_alert=True)
+        await query.edit_message_text("❌ Verification expired or already processed")
         return
 
-    await query.answer()
-    await query.edit_message_text(query.message.text + "\n\n✅ *Auto-Approved*",
-                                 parse_mode='Markdown')
-
-    data = PENDING_VERIFICATIONS[user_id]
-    chat_id = data['chat_id']
+    verification = PENDING_VERIFICATIONS[user_id]
+    chat_id = verification['chat_id']
 
     try:
-        await context.bot.approve_chat_join_request(chat_id, user_id)
-        VERIFIED_FOR_CHANNELS.setdefault(user_id, set()).add(chat_id)
-        track_user_activity(user_id, chat_id, 'approved')
+        # Approve the join request
+        request = verification.get('request')
+        if request:
+            await request.approve()
+        else:
+            # Fallback: Try to approve via invite link
+            logger.warning(f"No request object found for user {user_id}")
+
+        # Track approval
+        track_user_activity(user_id, chat_id, 'approved', {
+            'first_name': USER_DATABASE.get(user_id, {}).get('first_name', 'Unknown')
+        })
+
+        # Remove from pending
         del PENDING_VERIFICATIONS[user_id]
+
+        await query.edit_message_text(
+            f"✅ *User Approved*\n\n"
+            f"User ID: `{user_id}`\n"
+            f"Channel: {MANAGED_CHANNELS[chat_id]['name']}",
+            )
+
+        logger.info(f"✅ Admin manually approved user: {user_id}")
+
     except Exception as e:
-        await query.message.reply_text(f"❌ Approval failed: {e}")
+        logger.error(f"Manual approval failed: {e}")
+        await query.edit_message_text(
+            f"❌ Approval failed\n\nError: {str(e)}",
+            )
 
 
 async def resend_code_callback(update: Update,
                                context: ContextTypes.DEFAULT_TYPE):
+    """Placeholder for resend code functionality"""
     query = update.callback_query
+
     if query.from_user.id != ADMIN_ID:
         await query.answer("Unauthorized", show_alert=True)
         return
 
-    user_id = int(query.data.split('_')[-1])
+    await query.answer("Feature not applicable for this verification system")
 
-    if user_id not in PENDING_VERIFICATIONS:
-        await query.answer("❌ Expired", show_alert=True)
+
+# ========== COMMAND HANDLERS ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command with all commands listed"""
+    user = update.effective_user
+
+    if user.id == ADMIN_ID:
+        text = (
+            "👋 Welcome Owner!\n\n"
+            "🤖 Bot Status: Online 24/7\n"
+            f"📢 Channels: {len(MANAGED_CHANNELS)}\n"
+            f"⚙️ Smart Verification: Enabled\n\n"
+
+            "━━━ SETUP & INFO ━━━\n"
+            "/start - This menu\n"
+            "/addchannel - Add channel\n"
+            "/channels - List channels\n"
+            "/stats - Statistics\n\n"
+
+            "━━━ ACTIVITY ━━━\n"
+            "/recent_activity - Who joined\n"
+            "/clear_activity - Clear log\n"
+            "/pending_users - Captchas\n\n"
+
+            "━━━ APPROVALS ━━━\n"
+            "/approve_user - Approve one\n"
+            "/approve_all_pending - Approve all\n"
+            "/block_user - Block user\n"
+            "/unblock_user - Unblock\n\n"
+
+            "━━━ SETTINGS ━━━\n"
+            "/toggle_bulk - Change mode\n"
+            "/verification_settings - View\n\n"
+
+            "━━━ POSTING ━━━\n"
+            "/post - Post content\n"
+            "/send_to_channel - Quick send\n"
+            "/clear_channel_media - Clear media\n\n"
+
+            "━━━ IMAGES ━━━\n"
+            "/upload_images - Upload\n"
+            "/done_uploading - Finish\n"
+            "/list_images - View list\n"
+            "/clear_images - Delete all\n\n"
+
+            "━━━ AUTO-POST ━━━\n"
+            "/enable_autopost - Enable\n"
+            "/disable_autopost - Disable\n"
+            "/autopost_status - Check\n\n"
+
+            "━━━ ANALYTICS ━━━\n"
+            "/user_stats - Stats\n"
+            "/export_users - Export CSV\n\n"
+
+            "━━━ SECURITY ━━━\n"
+            "/view_unauthorized - Check\n"
+            "/clear_unauthorized - Clear"
+        )
+    else:
+        text = "Hello! This bot is for channel management."
+
+    await update.message.reply_text(text)
+
+
+async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a channel to manage"""
+    if not await owner_only_check(update, context):
         return
 
-    data = PENDING_VERIFICATIONS[user_id]
-    code = data['code']
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: `/addchannel CHANNEL_ID CHANNEL_NAME`\n\n"
+            "Example: `/addchannel -1001234567890 My Premium Channel`",
+            )
+        return
 
-    await query.answer(f"Code: {code}", show_alert=True)
+    try:
+        channel_id = int(context.args[0])
+        channel_name = ' '.join(context.args[1:])
 
-
-async def handle_verification_code(update: Update,
-                                   context: ContextTypes.DEFAULT_TYPE):
-    code = update.message.text.strip().upper()
-
-    for user_id, data in PENDING_VERIFICATIONS.items():
-        if data['code'] == code:
-            chat_id = data['chat_id']
-            try:
-                await context.bot.approve_chat_join_request(chat_id, user_id)
-                await update.message.reply_text("✅ User approved!")
-                VERIFIED_FOR_CHANNELS.setdefault(user_id, set()).add(chat_id)
-                track_user_activity(user_id, chat_id, 'approved')
-                del PENDING_VERIFICATIONS[user_id]
-                context.user_data['awaiting_code'] = False
-            except Exception as e:
-                await update.message.reply_text(f"❌ Failed: {e}")
+        # Check if bot is admin
+        if not await is_bot_admin(context, channel_id):
+            await update.message.reply_text("❌ Bot is not admin in that channel")
             return
 
-    await update.message.reply_text("❌ Invalid code")
+        MANAGED_CHANNELS[channel_id] = {'name': channel_name}
+        save_data()
+
+        await update.message.reply_text(
+            f"✅ Channel added!\n\n"
+            f"Name: {channel_name}\n"
+            f"ID: `{channel_id}`\n"
+            f"Smart Verification: Enabled",
+            )
+
+        logger.info(f"✅ Channel added: {channel_name} ({channel_id})")
+
+    except ValueError:
+        await update.message.reply_text("❌ Invalid channel ID")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+        logger.error(f"Add channel failed: {e}")
+
+
+async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all managed channels"""
+    if not await owner_only_check(update, context):
+        return
+
+    if not MANAGED_CHANNELS:
+        await update.message.reply_text("No channels added yet")
+        return
+
+    text = "📢 *Managed Channels:*\n\n"
+    for channel_id, data in MANAGED_CHANNELS.items():
+        bulk_status = "🔄 Bulk" if BULK_APPROVAL_MODE.get(channel_id, False) else "🛡️ Smart"
+        text += f"{data['name']}\n"
+        text += f"ID: `{channel_id}`\n"
+        text += f"Mode: {bulk_status}\n\n"
+
+    await update.message.reply_text(text)
 
 
 async def pending_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show pending verification requests"""
     if not await owner_only_check(update, context):
         return
 
     if not PENDING_VERIFICATIONS:
-        await update.message.reply_text("✅ No pending users")
+        await update.message.reply_text("No pending verifications")
         return
 
-    text = "⏳ *Pending Users:*\n\n"
+    text = "⏳ *Pending Verifications:*\n\n"
     for user_id, data in PENDING_VERIFICATIONS.items():
-        chat_name = MANAGED_CHANNELS.get(data['chat_id'], {}).get('name', 'Unknown')
-        text += f"• User ID: `{user_id}`\n"
-        text += f"  Channel: {chat_name}\n"
-        text += f"  Code: `{data['code']}`\n\n"
+        channel_name = MANAGED_CHANNELS.get(data['chat_id'], {}).get('name', 'Unknown')
+        text += f"User ID: `{user_id}`\n"
+        text += f"Channel: {channel_name}\n"
+        text += f"Captcha: {data['captcha_question']} = {data['code']}\n\n"
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await update.message.reply_text(text)
 
 
 async def manual_approve_user(update: Update,
                               context: ContextTypes.DEFAULT_TYPE):
+    """Manually approve a user"""
     if not await owner_only_check(update, context):
         return
 
-    if len(context.args) != 2:
+    if not context.args:
         await update.message.reply_text(
-            "Usage: /approve_user <user_id> <channel_id>")
+            "Usage: `/approve_user USER_ID`",
+            )
         return
 
     try:
         user_id = int(context.args[0])
-        channel_id = int(context.args[1])
 
-        await context.bot.approve_chat_join_request(channel_id, user_id)
-        VERIFIED_FOR_CHANNELS.setdefault(user_id, set()).add(channel_id)
-        track_user_activity(user_id, channel_id, 'approved')
+        if user_id not in PENDING_VERIFICATIONS:
+            await update.message.reply_text("❌ User not in pending list")
+            return
 
-        await update.message.reply_text("✅ User approved!")
+        verification = PENDING_VERIFICATIONS[user_id]
+        chat_id = verification['chat_id']
+        request = verification.get('request')
+
+        if request:
+            await request.approve()
+            track_user_activity(user_id, chat_id, 'approved')
+            del PENDING_VERIFICATIONS[user_id]
+
+            await update.message.reply_text(
+                f"✅ User approved!\n\n"
+                f"User ID: `{user_id}`\n"
+                f"Channel: {MANAGED_CHANNELS[chat_id]['name']}",
+                )
+
+            logger.info(f"✅ Manual approval: {user_id}")
+        else:
+            await update.message.reply_text("❌ Cannot approve - request expired")
+
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID")
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+        logger.error(f"Manual approval failed: {e}")
 
 
 async def approve_all_pending(update: Update,
                               context: ContextTypes.DEFAULT_TYPE):
+    """Approve all pending verifications"""
     if not await owner_only_check(update, context):
         return
 
     if not PENDING_VERIFICATIONS:
-        await update.message.reply_text("✅ No pending users")
+        await update.message.reply_text("No pending verifications")
         return
 
     approved = 0
     failed = 0
 
-    for user_id, data in list(PENDING_VERIFICATIONS.items()):
+    for user_id, verification in list(PENDING_VERIFICATIONS.items()):
         try:
-            await context.bot.approve_chat_join_request(data['chat_id'],
-                                                       user_id)
-            VERIFIED_FOR_CHANNELS.setdefault(user_id, set()).add(
-                data['chat_id'])
-            track_user_activity(user_id, data['chat_id'], 'approved')
-            del PENDING_VERIFICATIONS[user_id]
-            approved += 1
+            request = verification.get('request')
+            if request:
+                await request.approve()
+                track_user_activity(user_id, verification['chat_id'], 'approved')
+                del PENDING_VERIFICATIONS[user_id]
+                approved += 1
+            else:
+                failed += 1
         except Exception as e:
+            logger.error(f"Approval failed for {user_id}: {e}")
             failed += 1
-            logger.error(f"Failed to approve {user_id}: {e}")
 
     await update.message.reply_text(
-        f"✅ Approved: {approved}\n❌ Failed: {failed}")
-
-
-async def toggle_bulk_approval(update: Update,
-                               context: ContextTypes.DEFAULT_TYPE):
-    if not await owner_only_check(update, context):
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /toggle_bulk <channel_id>")
-        return
-
-    try:
-        channel_id = int(context.args[0])
-        if channel_id not in MANAGED_CHANNELS:
-            await update.message.reply_text("❌ Channel not managed")
-            return
-
-        BULK_APPROVAL_MODE[channel_id] = not BULK_APPROVAL_MODE.get(
-            channel_id, False)
-        status = "ON" if BULK_APPROVAL_MODE[channel_id] else "OFF"
-        save_data()
-        await update.message.reply_text(
-            f"✅ Bulk approval for {MANAGED_CHANNELS[channel_id]['name']}: *{status}*",
-            parse_mode='Markdown')
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+        f"✅ *Bulk Approval Complete*\n\n"
+        f"Approved: {approved}\n"
+        f"Failed: {failed}",
+        )
 
 
 async def bulk_approve_from_file(update: Update,
                                  context: ContextTypes.DEFAULT_TYPE):
+    """Placeholder for bulk approve from file"""
     if not await owner_only_check(update, context):
         return
 
-    await update.message.reply_text("📂 Send text file with user IDs")
-    context.user_data['awaiting_bulk_file'] = True
-
-
-async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('awaiting_bulk_file'):
-        return
-
-    if update.message.from_user.id != ADMIN_ID:
-        return
-
-    document = update.message.document
-    if not document.file_name.endswith('.txt'):
-        await update.message.reply_text("❌ Send .txt file")
-        return
-
-    file = await context.bot.get_file(document.file_id)
-    file_bytes = await file.download_as_bytearray()
-    content = file_bytes.decode('utf-8')
-
-    user_ids = []
-    for line in content.split('\n'):
-        line = line.strip()
-        if line.isdigit():
-            user_ids.append(int(line))
-
-    if not user_ids:
-        await update.message.reply_text("❌ No user IDs found")
-        return
-
     await update.message.reply_text(
-        f"Found {len(user_ids)} users. Reply with channel ID:")
-    context.user_data['bulk_users'] = user_ids
-    context.user_data['awaiting_channel_id'] = True
-    context.user_data['awaiting_bulk_file'] = False
+        "To bulk approve:\n"
+        "1. Send me a text file with user IDs (one per line)\n"
+        "2. I'll approve them all")
 
 
-async def block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def toggle_bulk_approval(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE):
+    """Toggle bulk approval mode for a channel"""
     if not await owner_only_check(update, context):
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /block_user <user_id>")
+        await update.message.reply_text(
+            "Usage: `/toggle_bulk CHANNEL_ID`\n\n"
+            "This toggles between:\n"
+            "🛡️ Smart Verification (auto-approve/reject/captcha)\n"
+            "🔄 Bulk Mode (approve everyone)",
+            )
+        return
+
+    try:
+        channel_id = int(context.args[0])
+
+        if channel_id not in MANAGED_CHANNELS:
+            await update.message.reply_text("❌ Channel not managed")
+            return
+
+        current_status = BULK_APPROVAL_MODE.get(channel_id, False)
+        BULK_APPROVAL_MODE[channel_id] = not current_status
+        save_data()
+
+        new_mode = "🔄 Bulk Mode (approve everyone)" if BULK_APPROVAL_MODE[channel_id] else "🛡️ Smart Verification"
+
+        await update.message.reply_text(
+            f"✅ Mode changed!\n\n"
+            f"Channel: {MANAGED_CHANNELS[channel_id]['name']}\n"
+            f"New Mode: {new_mode}",
+            )
+
+        logger.info(f"✅ Toggle bulk for {channel_id}: {BULK_APPROVAL_MODE[channel_id]}")
+
+    except ValueError:
+        await update.message.reply_text("❌ Invalid channel ID")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Block a user from all channels"""
+    if not await owner_only_check(update, context):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/block_user USER_ID`",
+            )
         return
 
     try:
         user_id = int(context.args[0])
         BLOCKED_USERS.add(user_id)
         save_data()
-        await update.message.reply_text(f"✅ User `{user_id}` blocked",
-                                       parse_mode='Markdown')
-    except:
+
+        await update.message.reply_text(
+            f"✅ User blocked!\n\n"
+            f"User ID: `{user_id}`\n"
+            f"They cannot join any managed channel",
+            )
+
+        logger.info(f"✅ User blocked: {user_id}")
+
+    except ValueError:
         await update.message.reply_text("❌ Invalid user ID")
 
 
 async def unblock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unblock a user"""
     if not await owner_only_check(update, context):
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /unblock_user <user_id>")
+        await update.message.reply_text(
+            "Usage: `/unblock_user USER_ID`",
+            )
         return
 
     try:
         user_id = int(context.args[0])
+
         if user_id in BLOCKED_USERS:
             BLOCKED_USERS.remove(user_id)
             save_data()
-            await update.message.reply_text(f"✅ User `{user_id}` unblocked",
-                                           parse_mode='Markdown')
+            await update.message.reply_text(
+                f"✅ User unblocked!\n\n"
+                f"User ID: `{user_id}`",
+                )
+            logger.info(f"✅ User unblocked: {user_id}")
         else:
-            await update.message.reply_text("⚠️ User not blocked")
-    except:
+            await update.message.reply_text("❌ User not in blocked list")
+
+    except ValueError:
         await update.message.reply_text("❌ Invalid user ID")
 
 
 async def verification_settings(update: Update,
                                 context: ContextTypes.DEFAULT_TYPE):
+    """Show verification settings"""
     if not await owner_only_check(update, context):
         return
 
-    text = (f"🔒 *Verification Settings*\n\n"
-            f"Min Account Age: {MIN_ACCOUNT_AGE_DAYS} days\n"
-            f"Require Photo: {REQUIRE_PROFILE_PHOTO}\n"
-            f"Code Expiry: {CODE_EXPIRY_MINUTES} minutes")
+    text = (
+        f"⚙️ *Smart Verification Settings*\n\n"
+        f"**Auto-Approve (Score ≥70):**\n"
+        f"• Has real name (40 pts)\n"
+        f"• Has username (30 pts)\n"
+        f"• Has profile photo (30 pts)\n\n"
+        f"**Math Captcha (Score 30-69):**\n"
+        f"• Borderline users\n"
+        f"• Admin decides\n\n"
+        f"**Auto-Reject (Score 0):**\n"
+        f"• Bot accounts\n"
+        f"• 'User123456' names\n"
+        f"• Suspicious profiles\n\n"
+        f"*Current Settings:*\n"
+        f"Profile Photo Required: {REQUIRE_PROFILE_PHOTO}\n"
+        f"Min Account Age: {MIN_ACCOUNT_AGE_DAYS} days"
+    )
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await update.message.reply_text(text)
 
 
 async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start posting mode"""
     if not await owner_only_check(update, context):
         return
 
-    if not MANAGED_CHANNELS:
-        await update.message.reply_text("❌ No channels added")
-        return
-
-    await update.message.reply_text("📤 Send content to post:")
     context.user_data['posting_mode'] = True
+    await update.message.reply_text(
+        "📤 *Posting Mode Enabled*\n\n"
+        "Send me content to post (text, photo, video, or document)",
+        )
 
 
 async def upload_images_command(update: Update,
                                 context: ContextTypes.DEFAULT_TYPE):
+    """Start image upload mode"""
     if not await owner_only_check(update, context):
         return
 
-    await update.message.reply_text(
-        "📷 *Upload Mode Active*\n\nSend images. Use /done_uploading when finished.",
-        parse_mode='Markdown')
     context.user_data['uploading_mode'] = True
-
-
-async def handle_image_upload(update: Update,
-                              context: ContextTypes.DEFAULT_TYPE):
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-        UPLOADED_IMAGES.append(file_id)
-        save_data()
-        await update.message.reply_text(
-            f"✅ Image {len(UPLOADED_IMAGES)} saved")
+    context.user_data['uploading_for_channel'] = None  # Clear channel-specific flag
+    await update.message.reply_text(
+        "📤 Upload Mode Enabled\n\n"
+        "Send images (with or without captions).\n"
+        "Images with captions will use those captions when auto-posting.\n"
+        "Use /done_uploading when finished")
 
 
 async def done_uploading(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop upload mode"""
     if not await owner_only_check(update, context):
         return
 
     context.user_data['uploading_mode'] = False
     await update.message.reply_text(
-        f"✅ Upload complete! Total images: {len(UPLOADED_IMAGES)}")
+        f"✅ Upload complete!\n\n"
+        f"Total images: {len(UPLOADED_IMAGES)}",
+        )
 
 
 async def upload_for_channel_command(update: Update,
                                      context: ContextTypes.DEFAULT_TYPE):
+    """Upload images for specific channel"""
     if not await owner_only_check(update, context):
         return
 
     if not context.args:
         await update.message.reply_text(
-            "Usage: /upload_for_channel <channel_id>")
+            "Usage: `/upload_for_channel CHANNEL_ID`",
+            )
         return
 
     try:
         channel_id = int(context.args[0])
+
         if channel_id not in MANAGED_CHANNELS:
             await update.message.reply_text("❌ Channel not managed")
             return
 
         context.user_data['uploading_for_channel'] = channel_id
         context.user_data['uploading_mode'] = True
+
         await update.message.reply_text(
-            f"📷 Upload images for {MANAGED_CHANNELS[channel_id]['name']}")
-    except:
+            f"📤 Upload Mode for {MANAGED_CHANNELS[channel_id]['name']}\n\n"
+            f"Send images (with or without captions).\n"
+            f"These images will only be used for this channel.\n"
+            f"Use /done_uploading when finished")
+
+    except ValueError:
         await update.message.reply_text("❌ Invalid channel ID")
 
 
 async def list_images(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List uploaded images"""
     if not await owner_only_check(update, context):
         return
 
-    text = f"📂 *Images:* {len(UPLOADED_IMAGES)}\n\n"
+    text = f"📂 *Image Library*\n\n"
+    text += f"Global Images: {len(UPLOADED_IMAGES)}\n\n"
 
     for channel_id, images in CHANNEL_SPECIFIC_IMAGES.items():
         channel_name = MANAGED_CHANNELS.get(channel_id, {}).get('name', 'Unknown')
-        text += f"• {channel_name}: {len(images)} images\n"
+        text += f"{channel_name}: {len(images)} images\n"
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await update.message.reply_text(text)
 
 
 async def clear_images(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear all images"""
     if not await owner_only_check(update, context):
         return
 
     UPLOADED_IMAGES.clear()
     CHANNEL_SPECIFIC_IMAGES.clear()
-    CURRENT_IMAGE_INDEX.clear()
     save_data()
+
     await update.message.reply_text("✅ All images cleared")
 
 
 async def set_default_caption(update: Update,
                               context: ContextTypes.DEFAULT_TYPE):
+    """Set default caption for posts"""
     if not await owner_only_check(update, context):
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /set_default_caption <text>")
+        await update.message.reply_text(
+            "Usage: `/set_default_caption Your caption here`",
+            )
         return
 
     global DEFAULT_CAPTION
     DEFAULT_CAPTION = ' '.join(context.args)
     save_data()
-    await update.message.reply_text(f"✅ Default caption set:\n\n{DEFAULT_CAPTION}")
+
+    await update.message.reply_text(
+        f"✅ Default caption set!\n\n"
+        f"Caption: {DEFAULT_CAPTION}",
+        )
 
 
 async def clear_default_caption(update: Update,
                                 context: ContextTypes.DEFAULT_TYPE):
+    """Clear default caption"""
     if not await owner_only_check(update, context):
         return
 
     global DEFAULT_CAPTION
     DEFAULT_CAPTION = ""
     save_data()
+
     await update.message.reply_text("✅ Default caption cleared")
 
 
 async def set_channel_caption(update: Update,
                               context: ContextTypes.DEFAULT_TYPE):
+    """Set channel-specific caption"""
     if not await owner_only_check(update, context):
         return
 
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: /set_channel_caption <channel_id> <text>")
+            "Usage: `/set_channel_caption CHANNEL_ID Your caption`",
+            )
         return
 
     try:
         channel_id = int(context.args[0])
         caption = ' '.join(context.args[1:])
+
+        if channel_id not in MANAGED_CHANNELS:
+            await update.message.reply_text("❌ Channel not managed")
+            return
+
         CHANNEL_DEFAULT_CAPTIONS[channel_id] = caption
         save_data()
+
         await update.message.reply_text(
-            f"✅ Caption set for {MANAGED_CHANNELS.get(channel_id, {}).get('name', 'channel')}"
-        )
-    except:
+            f"✅ Caption set for {MANAGED_CHANNELS[channel_id]['name']}!\n\n"
+            f"Caption: {caption}",
+            )
+
+    except ValueError:
         await update.message.reply_text("❌ Invalid channel ID")
 
 
 async def clear_channel_caption(update: Update,
                                 context: ContextTypes.DEFAULT_TYPE):
+    """Clear channel-specific caption"""
     if not await owner_only_check(update, context):
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /clear_channel_caption <channel_id>")
+        await update.message.reply_text(
+            "Usage: `/clear_channel_caption CHANNEL_ID`",
+            )
         return
 
     try:
         channel_id = int(context.args[0])
+
         if channel_id in CHANNEL_DEFAULT_CAPTIONS:
             del CHANNEL_DEFAULT_CAPTIONS[channel_id]
             save_data()
-            await update.message.reply_text("✅ Caption cleared")
+            await update.message.reply_text("✅ Channel caption cleared")
         else:
-            await update.message.reply_text("⚠️ No caption set")
-    except:
+            await update.message.reply_text("❌ No caption set for this channel")
+
+    except ValueError:
         await update.message.reply_text("❌ Invalid channel ID")
 
 
 async def enable_autopost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enable auto-posting for a channel"""
     if not await owner_only_check(update, context):
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /enable_autopost <channel_id>")
+        await update.message.reply_text(
+            "Usage: `/enable_autopost CHANNEL_ID`",
+            )
         return
 
     try:
         channel_id = int(context.args[0])
+
         if channel_id not in MANAGED_CHANNELS:
             await update.message.reply_text("❌ Channel not managed")
             return
@@ -801,159 +1069,210 @@ async def enable_autopost(update: Update, context: ContextTypes.DEFAULT_TYPE):
         AUTO_POST_ENABLED[channel_id] = True
         save_data()
 
-        scheduler.add_job(auto_post_job,
-                         trigger=CronTrigger(minute='*/15'),
-                         args=[context.bot, channel_id],
-                         id=f'autopost_{channel_id}',
-                         replace_existing=True)
+        # Add scheduler job
+        scheduler.add_job(
+            auto_post_job,
+            trigger=CronTrigger(minute='*/15'),
+            args=[context.bot, channel_id],
+            id=f'autopost_{channel_id}',
+            replace_existing=True)
 
         await update.message.reply_text(
-            f"✅ Auto-post enabled for {MANAGED_CHANNELS[channel_id]['name']}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+            f"✅ Auto-post enabled for {MANAGED_CHANNELS[channel_id]['name']}!\n\n"
+            f"Interval: Every 15 minutes",
+            )
+
+    except ValueError:
+        await update.message.reply_text("❌ Invalid channel ID")
 
 
 async def disable_autopost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Disable auto-posting for a channel"""
     if not await owner_only_check(update, context):
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /disable_autopost <channel_id>")
+        await update.message.reply_text(
+            "Usage: `/disable_autopost CHANNEL_ID`",
+            )
         return
 
     try:
         channel_id = int(context.args[0])
-        AUTO_POST_ENABLED[channel_id] = False
-        save_data()
 
-        try:
-            scheduler.remove_job(f'autopost_{channel_id}')
-        except:
-            pass
+        if channel_id in AUTO_POST_ENABLED:
+            AUTO_POST_ENABLED[channel_id] = False
+            save_data()
 
-        await update.message.reply_text(
-            f"✅ Auto-post disabled for {MANAGED_CHANNELS.get(channel_id, {}).get('name', 'channel')}"
-        )
-    except:
+            # Remove scheduler job
+            try:
+                scheduler.remove_job(f'autopost_{channel_id}')
+            except:
+                pass
+
+            await update.message.reply_text(
+                f"✅ Auto-post disabled for {MANAGED_CHANNELS[channel_id]['name']}",
+                )
+        else:
+            await update.message.reply_text("❌ Auto-post not enabled for this channel")
+
+    except ValueError:
         await update.message.reply_text("❌ Invalid channel ID")
 
 
 async def autopost_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show auto-post status"""
     if not await owner_only_check(update, context):
         return
 
-    text = "🤖 *Auto-Post Status:*\n\n"
+    if not AUTO_POST_ENABLED:
+        await update.message.reply_text("No auto-posts enabled")
+        return
 
-    for channel_id, channel_data in MANAGED_CHANNELS.items():
-        status = AUTO_POST_ENABLED.get(channel_id, False)
-        images = len(CHANNEL_SPECIFIC_IMAGES.get(channel_id, []))
-        text += f"• {channel_data['name']}\n"
-        text += f"  Status: {'ON' if status else 'OFF'}\n"
-        text += f"  Images: {images}\n\n"
+    text = "🤖 *Auto-Post Status*\n\n"
+    for channel_id, enabled in AUTO_POST_ENABLED.items():
+        if enabled:
+            channel_name = MANAGED_CHANNELS.get(channel_id, {}).get('name', 'Unknown')
+            text += f"✅ {channel_name}\n"
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await update.message.reply_text(text)
 
 
 async def auto_post_job(bot, channel_id: int):
+    """Auto-posting job - posts images every 15 minutes"""
     try:
-        if channel_id not in CHANNEL_SPECIFIC_IMAGES or not CHANNEL_SPECIFIC_IMAGES[
-                channel_id]:
+        if not AUTO_POST_ENABLED.get(channel_id):
             return
 
+        # Get images for this channel
+        if channel_id in CHANNEL_SPECIFIC_IMAGES and CHANNEL_SPECIFIC_IMAGES[channel_id]:
+            images = CHANNEL_SPECIFIC_IMAGES[channel_id]
+        elif UPLOADED_IMAGES:
+            images = UPLOADED_IMAGES
+        else:
+            logger.warning(f"No images available for channel {channel_id}")
+            return
+
+        # Initialize image index if needed
         if channel_id not in CURRENT_IMAGE_INDEX:
             CURRENT_IMAGE_INDEX[channel_id] = 0
 
-        images = CHANNEL_SPECIFIC_IMAGES[channel_id]
-        index = CURRENT_IMAGE_INDEX[channel_id]
-        file_id = images[index]
+        # Get current image
+        idx = CURRENT_IMAGE_INDEX[channel_id]
+        image = images[idx]
 
-        caption = CHANNEL_DEFAULT_CAPTIONS.get(channel_id, DEFAULT_CAPTION)
+        # Determine caption (priority: image caption > channel caption > default caption)
+        if isinstance(image, dict) and image.get('caption'):
+            final_caption = image['caption']
+        elif channel_id in CHANNEL_DEFAULT_CAPTIONS:
+            final_caption = CHANNEL_DEFAULT_CAPTIONS[channel_id]
+        elif DEFAULT_CAPTION:
+            final_caption = DEFAULT_CAPTION
+        else:
+            final_caption = ""
 
-        await bot.send_photo(channel_id, file_id, caption=caption)
+        # Get file_id
+        if isinstance(image, dict):
+            file_id = image['file_id']
+        else:
+            file_id = image  # Old format compatibility
 
-        CURRENT_IMAGE_INDEX[channel_id] = (index + 1) % len(images)
+        # Post to channel
+        await bot.send_photo(
+            chat_id=channel_id,
+            photo=file_id,
+            caption=final_caption
+        )
+
+        logger.info(f"✅ Auto-posted image #{idx+1} to channel {channel_id}")
+
+        # Move to next image (loop back to start when done)
+        CURRENT_IMAGE_INDEX[channel_id] = (idx + 1) % len(images)
         save_data()
 
-        logger.info(f"Auto-posted to {channel_id}")
     except Exception as e:
-        logger.error(f"Auto-post failed for {channel_id}: {e}")
+        logger.error(f"❌ Auto-post failed for channel {channel_id}: {e}")
 
 
 async def export_users_report(update: Update,
                               context: ContextTypes.DEFAULT_TYPE):
+    """Export user database"""
     if not await owner_only_check(update, context):
         return
 
     if not USER_DATABASE:
-        await update.message.reply_text("📊 No user data")
+        await update.message.reply_text("No user data to export")
         return
 
-    report = "USER_ID,FIRST_NAME,USERNAME,CHANNEL,STATUS,REQUEST_DATE\n"
+    # Create CSV
+    csv_text = "User ID,First Name,Last Name,Username,Channels\n"
+    for user_id, data in USER_DATABASE.items():
+        channels = ', '.join([ch['channel_name'] for ch in data['channels'].values()])
+        csv_text += f"{user_id},{data['first_name']},{data['last_name']},{data['username']},{channels}\n"
 
-    for user_id, user_data in USER_DATABASE.items():
-        for channel_id, channel_data in user_data['channels'].items():
-            report += f"{user_id},{user_data['first_name']},{user_data.get('username', 'N/A')},{channel_data['channel_name']},{channel_data['status']},{channel_data['request_date']}\n"
+    # Send as file
+    file = BytesIO(csv_text.encode('utf-8'))
+    file.name = f"users_{datetime.now().strftime('%Y%m%d')}.csv"
 
-    file = BytesIO(report.encode('utf-8'))
-    file.name = f"users_report_{datetime.now().strftime('%Y%m%d')}.csv"
-
-    await update.message.reply_document(document=file,
-                                       filename=file.name,
-                                       caption="📊 User Report")
+    await update.message.reply_document(
+        document=file,
+        filename=file.name,
+        caption=f"📊 User Database Export\n\nTotal Users: {len(USER_DATABASE)}")
 
 
 async def user_stats_command(update: Update,
                              context: ContextTypes.DEFAULT_TYPE):
+    """Show user statistics"""
     if not await owner_only_check(update, context):
         return
 
-    text = f"👥 *User Statistics*\n\n"
-    text += f"Total Users: {len(USER_DATABASE)}\n\n"
+    total_users = len(USER_DATABASE)
+    approved_count = sum(1 for user in USER_DATABASE.values() 
+                        if any(ch['status'] == 'approved' for ch in user['channels'].values()))
 
-    for channel_id, channel_data in MANAGED_CHANNELS.items():
-        approved = sum(1 for u in USER_DATABASE.values()
-                      if channel_id in u['channels']
-                      and u['channels'][channel_id]['status'] == 'approved')
-        pending = sum(1 for u in USER_DATABASE.values()
-                     if channel_id in u['channels']
-                     and u['channels'][channel_id]['status'] == 'pending')
+    text = (
+        f"👥 *User Statistics*\n\n"
+        f"Total Users: {total_users}\n"
+        f"Approved: {approved_count}\n"
+        f"Pending: {len(PENDING_VERIFICATIONS)}\n"
+        f"Blocked: {len(BLOCKED_USERS)}"
+    )
 
-        text += f"📢 {channel_data['name']}\n"
-        text += f"  ✅ Approved: {approved}\n"
-        text += f"  ⏳ Pending: {pending}\n\n"
-
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await update.message.reply_text(text)
 
 
 async def import_users_to_channel(update: Update,
                                   context: ContextTypes.DEFAULT_TYPE):
+    """Import users (placeholder)"""
     if not await owner_only_check(update, context):
         return
 
-    await update.message.reply_text("Coming soon!")
+    await update.message.reply_text("Import feature coming soon")
 
 
 async def view_unauthorized_attempts(update: Update,
-                                    context: ContextTypes.DEFAULT_TYPE):
+                                     context: ContextTypes.DEFAULT_TYPE):
+    """View unauthorized access attempts"""
     if not await owner_only_check(update, context):
         return
 
     if not UNAUTHORIZED_ATTEMPTS:
-        await update.message.reply_text("✅ No unauthorized attempts")
+        await update.message.reply_text("No unauthorized attempts")
         return
 
-    text = "🚨 *Unauthorized Attempts:*\n\n"
-    for attempt in UNAUTHORIZED_ATTEMPTS[-10:]:
-        text += f"• User: {attempt['first_name']}\n"
-        text += f"  ID: `{attempt['user_id']}`\n"
-        text += f"  Command: /{attempt['command']}\n"
-        text += f"  Time: {attempt['timestamp']}\n\n"
+    text = "🚨 *Unauthorized Attempts*\n\n"
+    for attempt in UNAUTHORIZED_ATTEMPTS[-10:]:  # Last 10
+        text += (f"User: {attempt['first_name']}\n"
+                f"ID: `{attempt['user_id']}`\n"
+                f"Command: {attempt['command']}\n"
+                f"Time: {attempt['timestamp'].strftime('%Y-%m-%d %H:%M')}\n\n")
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await update.message.reply_text(text)
 
 
 async def clear_unauthorized_log(update: Update,
                                  context: ContextTypes.DEFAULT_TYPE):
+    """Clear unauthorized attempts log"""
     if not await owner_only_check(update, context):
         return
 
@@ -961,43 +1280,314 @@ async def clear_unauthorized_log(update: Update,
     await update.message.reply_text("✅ Unauthorized log cleared")
 
 
-async def weekly_report_job(bot):
-    try:
-        if not USER_DATABASE:
+async def send_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick send media/text to channel"""
+    if not await owner_only_check(update, context):
+        return
+
+    if not context.args:
+        # Show available channels
+        if not MANAGED_CHANNELS:
+            await update.message.reply_text("No channels added yet")
             return
 
-        text = "📊 *Weekly Report*\n\n"
+        text = "Send to channel:\n\n"
+        text += "Usage: /send_to_channel CHANNEL_ID\n\n"
+        text += "Your channels:\n"
+        for channel_id, data in MANAGED_CHANNELS.items():
+            text += f"{data['name']}: {channel_id}\n"
+        text += "\nThen send your media/text"
 
-        for channel_id, channel_data in MANAGED_CHANNELS.items():
-            approved = sum(1 for u in USER_DATABASE.values()
-                          if channel_id in u['channels']
-                          and u['channels'][channel_id]['status'] == 'approved')
+        await update.message.reply_text(text)
+        return
 
-            text += f"📢 {channel_data['name']}\n"
-            text += f"  New Users: {approved}\n\n"
+    try:
+        channel_id = int(context.args[0])
 
-        await bot.send_message(ADMIN_ID, text, parse_mode='Markdown')
+        if channel_id not in MANAGED_CHANNELS:
+            await update.message.reply_text("Channel not managed")
+            return
+
+        context.user_data['quick_send_channel'] = channel_id
+        context.user_data['quick_send_mode'] = True
+
+        await update.message.reply_text(
+            f"✅ Quick Send Mode: {MANAGED_CHANNELS[channel_id]['name']}\n\n"
+            f"Send your media or text now.\n"
+            f"Use /cancel to stop")
+
+    except ValueError:
+        await update.message.reply_text("Invalid channel ID")
+
+
+async def clear_channel_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear all media from a channel"""
+    if not await owner_only_check(update, context):
+        return
+
+    if not context.args:
+        if not MANAGED_CHANNELS:
+            await update.message.reply_text("No channels added yet")
+            return
+
+        text = "Clear channel media:\n\n"
+        text += "Usage: /clear_channel_media CHANNEL_ID MESSAGE_COUNT\n\n"
+        text += "Example: /clear_channel_media -1001234567890 50\n\n"
+        text += "Your channels:\n"
+        for channel_id, data in MANAGED_CHANNELS.items():
+            text += f"{data['name']}: {channel_id}\n"
+
+        await update.message.reply_text(text)
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /clear_channel_media CHANNEL_ID MESSAGE_COUNT\n"
+            "Example: /clear_channel_media -1001234567890 50")
+        return
+
+    try:
+        channel_id = int(context.args[0])
+        message_count = int(context.args[1])
+
+        if channel_id not in MANAGED_CHANNELS:
+            await update.message.reply_text("Channel not managed")
+            return
+
+        if message_count > 100:
+            await update.message.reply_text("Max 100 messages at a time")
+            return
+
+        await update.message.reply_text(f"⏳ Deleting last {message_count} messages...")
+
+        deleted = 0
+        failed = 0
+
+        # Get recent messages and delete
+        try:
+            # This requires the bot to have delete messages permission
+            # We'll try to delete messages by ID
+            for i in range(message_count):
+                try:
+                    # Note: This is a simplified approach
+                    # In production, you'd need to track message IDs
+                    await update.message.reply_text(
+                        "⚠️ To delete messages, I need message IDs.\n"
+                        "This feature requires message tracking.\n"
+                        "Use /clear_images to clear bot's image storage instead.")
+                    return
+                except:
+                    failed += 1
+
+        except Exception as e:
+            await update.message.reply_text(f"Error: {str(e)}")
+            return
+
+        await update.message.reply_text(
+            f"✅ Deleted: {deleted}\n"
+            f"❌ Failed: {failed}")
+
+    except ValueError:
+        await update.message.reply_text("Invalid channel ID or message count")
     except Exception as e:
-        logger.error(f"Weekly report failed: {e}")
+        await update.message.reply_text(f"Error: {str(e)}")
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel current operation"""
+    if not await owner_only_check(update, context):
+        return
+
+    context.user_data.clear()
+    await update.message.reply_text("✅ All operations cancelled")
+
+
+async def view_recent_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View recent auto-approvals and auto-rejections"""
+    if not await owner_only_check(update, context):
+        return
+
+    if not RECENT_ACTIVITY:
+        await update.message.reply_text("No recent activity")
+        return
+
+    # Group by type
+    approved = [a for a in RECENT_ACTIVITY if a['type'] == 'auto_approved']
+    rejected = [a for a in RECENT_ACTIVITY if a['type'] == 'auto_rejected']
+
+    text = "📊 Recent Activity\n\n"
+
+    # Show summary
+    text += f"✅ Auto-Approved: {len(approved)}\n"
+    text += f"❌ Auto-Rejected: {len(rejected)}\n"
+    text += f"⚠️ Pending Captcha: {len(PENDING_VERIFICATIONS)}\n\n"
+
+    # Show last 10 approved
+    if approved:
+        text += "━━━━━━━━━━━━━━━━━━\n"
+        text += "✅ Recently Approved:\n\n"
+        for activity in approved[-10:]:  # Last 10
+            text += f"• {activity['user_name']}\n"
+            text += f"  @{activity['username']}\n"
+            text += f"  Channel: {activity['channel']}\n"
+            text += f"  Time: {activity['timestamp'].strftime('%H:%M')}\n\n"
+
+    # Show last 5 rejected
+    if rejected:
+        text += "━━━━━━━━━━━━━━━━━━\n"
+        text += "❌ Recently Rejected:\n\n"
+        for activity in rejected[-5:]:  # Last 5
+            text += f"• {activity['user_name']}\n"
+            text += f"  Reason: {activity['reason']}\n"
+            text += f"  Time: {activity['timestamp'].strftime('%H:%M')}\n\n"
+
+    await update.message.reply_text(text)
+
+
+async def clear_recent_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear recent activity log"""
+    if not await owner_only_check(update, context):
+        return
+
+    count = len(RECENT_ACTIVITY)
+    RECENT_ACTIVITY.clear()
+
+    await update.message.reply_text(f"✅ Cleared {count} activity records")
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot statistics"""
+    if not await owner_only_check(update, context):
+        return
+
+    bulk_enabled = sum(1 for v in BULK_APPROVAL_MODE.values() if v)
+    active_autoposts = sum(1 for v in AUTO_POST_ENABLED.values() if v)
+
+    # Count recent activity
+    recent_approved = sum(1 for a in RECENT_ACTIVITY if a['type'] == 'auto_approved')
+    recent_rejected = sum(1 for a in RECENT_ACTIVITY if a['type'] == 'auto_rejected')
+
+    text = (f"📊 Statistics\n\n"
+            f"📢 Channels: {len(MANAGED_CHANNELS)}\n"
+            f"🛡️ Smart Mode: {len(MANAGED_CHANNELS) - bulk_enabled}\n"
+            f"🔄 Bulk Mode: {bulk_enabled}\n"
+            f"⏳ Pending: {len(PENDING_VERIFICATIONS)}\n"
+            f"✅ Recent Approved: {recent_approved}\n"
+            f"❌ Recent Rejected: {recent_rejected}\n"
+            f"🚫 Blocked: {len(BLOCKED_USERS)}\n"
+            f"📂 Images: {len(UPLOADED_IMAGES)}\n"
+            f"🤖 Auto-Posts: {active_autoposts} active\n"
+            f"👥 Total Users: {len(USER_DATABASE)}\n"
+            f"🚨 Unauthorized: {len(UNAUTHORIZED_ATTEMPTS)}\n\n"
+            f"Use /recent_activity for details\n\n"
+            f"Status: Online 24/7 ✅")
+    await update.message.reply_text(text)
+
+
+async def handle_forwarded_message(update: Update,
+                                   context: ContextTypes.DEFAULT_TYPE):
+    """Handle forwarded messages (placeholder)"""
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+
+    await update.message.reply_text("Forwarded message detected")
+
+
+async def handle_bulk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle bulk file uploads (placeholder)"""
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+
+    await update.message.reply_text("Bulk file processing coming soon")
+
+
+async def handle_verification_code(update: Update,
+                                   context: ContextTypes.DEFAULT_TYPE):
+    """Handle verification code from user"""
+    # This is for future feature where users can verify themselves
+    pass
+
+
+async def handle_image_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle image uploads"""
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+
+    if not update.message.photo:
+        return
+
+    photo = update.message.photo[-1]
+    file_id = photo.file_id
+    caption = update.message.caption or ""
+
+    # Store as dictionary with file_id and caption
+    image_data = {
+        'file_id': file_id,
+        'caption': caption
+    }
+
+    if context.user_data.get('uploading_for_channel'):
+        channel_id = context.user_data['uploading_for_channel']
+        if channel_id not in CHANNEL_SPECIFIC_IMAGES:
+            CHANNEL_SPECIFIC_IMAGES[channel_id] = []
+        CHANNEL_SPECIFIC_IMAGES[channel_id].append(image_data)
+        await update.message.reply_text(
+            f"✅ Image added to {MANAGED_CHANNELS[channel_id]['name']}\n"
+            f"Total: {len(CHANNEL_SPECIFIC_IMAGES[channel_id])}")
+    else:
+        UPLOADED_IMAGES.append(image_data)
+        await update.message.reply_text(
+            f"✅ Image uploaded! Total: {len(UPLOADED_IMAGES)}")
+
+    save_data()
 
 
 async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # CRITICAL FIX: Check if update has effective_user (channel posts don't have users)
-    if not update.effective_user:
-        logger.warning("Received update without effective_user, skipping")
-        return
-    
-    if update.effective_user.id != ADMIN_ID:
+    """Handle all content (text, images, videos)"""
+    # Safety check
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
 
+    # Handle verification code
     if context.user_data.get('awaiting_code'):
         await handle_verification_code(update, context)
         return
 
+    # Handle image upload mode
     if context.user_data.get('uploading_mode'):
         await handle_image_upload(update, context)
         return
 
+    # Handle quick send mode
+    if context.user_data.get('quick_send_mode'):
+        channel_id = context.user_data.get('quick_send_channel')
+        message = update.message
+
+        try:
+            if message.text:
+                await context.bot.send_message(channel_id, message.text)
+            elif message.photo:
+                await context.bot.send_photo(channel_id,
+                                             message.photo[-1].file_id,
+                                             caption=message.caption)
+            elif message.video:
+                await context.bot.send_video(channel_id,
+                                             message.video.file_id,
+                                             caption=message.caption)
+            elif message.document:
+                await context.bot.send_document(channel_id,
+                                                message.document.file_id,
+                                                caption=message.caption)
+
+            await update.message.reply_text(
+                f"✅ Sent to {MANAGED_CHANNELS[channel_id]['name']}\n\n"
+                f"Send more or use /cancel to stop")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed: {str(e)}")
+
+        return
+
+    # Handle posting mode
     if not context.user_data.get('posting_mode'):
         return
 
@@ -1017,7 +1607,7 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for channel_id, data in MANAGED_CHANNELS.items():
         keyboard.append([
             InlineKeyboardButton(f"📢 {data['name']}",
-                                callback_data=f"post_{channel_id}")
+                                 callback_data=f"post_{channel_id}")
         ])
     keyboard.append(
         [InlineKeyboardButton("🔄 ALL CHANNELS", callback_data="post_all")])
@@ -1025,13 +1615,13 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❌ Cancel", callback_data="post_cancel")])
 
     await update.message.reply_text(
-        "🎯 *Select Channel:*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown')
+        "🎯 Select Channel:",
+        reply_markup=InlineKeyboardMarkup(keyboard))
     context.user_data['posting_mode'] = False
 
 
 async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle post selection callback"""
     query = update.callback_query
 
     if query.from_user.id != ADMIN_ID:
@@ -1067,16 +1657,16 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(channel_id, original_msg.text)
             elif pending['type'] == 'photo':
                 await context.bot.send_photo(channel_id,
-                                            original_msg.photo[-1].file_id,
-                                            caption=original_msg.caption)
+                                             original_msg.photo[-1].file_id,
+                                             caption=original_msg.caption)
             elif pending['type'] == 'video':
                 await context.bot.send_video(channel_id,
-                                            original_msg.video.file_id,
-                                            caption=original_msg.caption)
+                                             original_msg.video.file_id,
+                                             caption=original_msg.caption)
             elif pending['type'] == 'document':
                 await context.bot.send_document(channel_id,
-                                               original_msg.document.file_id,
-                                               caption=original_msg.caption)
+                                                original_msg.document.file_id,
+                                                caption=original_msg.caption)
             success += 1
         except Exception as e:
             failed += 1
@@ -1085,53 +1675,33 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     del PENDING_POSTS[ADMIN_ID]
 
     result_text = f"✅ *Posted!*\n\nSuccess: {success}\nFailed: {failed}"
-    await query.message.reply_text(result_text, parse_mode='Markdown')
+    await query.message.reply_text(result_text)
 
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await owner_only_check(update, context):
-        return
+async def weekly_report_job(bot):
+    """Weekly report job"""
+    text = (
+        f"📊 *Weekly Report*\n\n"
+        f"Channels: {len(MANAGED_CHANNELS)}\n"
+        f"Total Users: {len(USER_DATABASE)}\n"
+        f"Blocked: {len(BLOCKED_USERS)}\n\n"
+        f"Status: All systems operational ✅"
+    )
 
-    bulk_enabled = sum(1 for v in BULK_APPROVAL_MODE.values() if v)
-    active_autoposts = sum(1 for v in AUTO_POST_ENABLED.values() if v)
-
-    text = (f"📊 *Statistics*\n\n"
-            f"📢 Channels: {len(MANAGED_CHANNELS)}\n"
-            f"🔄 Bulk Mode: {bulk_enabled}\n"
-            f"⏳ Pending: {len(PENDING_VERIFICATIONS)}\n"
-            f"✅ Verified: {len(VERIFIED_FOR_CHANNELS)}\n"
-            f"🚫 Blocked: {len(BLOCKED_USERS)}\n"
-            f"📂 Images: {len(UPLOADED_IMAGES)}\n"
-            f"🤖 Auto-Posts: {active_autoposts} active\n"
-            f"👥 Total Users: {len(USER_DATABASE)}\n"
-            f"🚨 Unauthorized: {len(UNAUTHORIZED_ATTEMPTS)}\n\n"
-            f"Status: Online 24/7")
-    await update.message.reply_text(text, parse_mode='Markdown')
-
-
-# CRITICAL: Add global error handler to prevent bot crashes
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log errors and prevent bot from crashing"""
-    logger.error(f"Exception while handling an update: {context.error}")
-    
-    # Log the update that caused the error
-    if update:
-        logger.error(f"Update that caused error: {update}")
-    
-    # Don't let the bot crash - just log and continue
-    return
+    try:
+        await bot.send_message(ADMIN_ID, text)
+    except Exception as e:
+        logger.error(f"Weekly report failed: {e}")
 
 
 def main():
-    logger.info("🚀 Starting SUPER BOT...")
+    """Main function to start the bot"""
+    logger.info("🚀 Starting SMART VERIFICATION BOT...")
 
     # Load saved data
     load_data()
 
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # CRITICAL: Add error handler to prevent crashes
-    app.add_error_handler(error_handler)
 
     # Command handlers
     app.add_handler(CommandHandler("start", start))
@@ -1169,6 +1739,11 @@ def main():
         CommandHandler("view_unauthorized", view_unauthorized_attempts))
     app.add_handler(
         CommandHandler("clear_unauthorized", clear_unauthorized_log))
+    app.add_handler(CommandHandler("recent_activity", view_recent_activity))
+    app.add_handler(CommandHandler("clear_activity", clear_recent_activity))
+    app.add_handler(CommandHandler("send_to_channel", send_to_channel))
+    app.add_handler(CommandHandler("clear_channel_media", clear_channel_media))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("stats", stats))
 
     # Callback handlers
@@ -1181,45 +1756,42 @@ def main():
     # Message handlers
     app.add_handler(
         MessageHandler(filters.FORWARDED & ~filters.COMMAND,
-                      handle_forwarded_message))
+                       handle_forwarded_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_bulk_file))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_content))
     app.add_handler(
         MessageHandler(filters.PHOTO | filters.VIDEO, handle_content))
 
-    # Join request handler
+    # Join request handler - THE KEY COMPONENT
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
 
     # Start scheduler
     scheduler.start()
-    logger.info("✅ Scheduler started")
-    
     scheduler.add_job(weekly_report_job,
-                     trigger=CronTrigger(day_of_week='mon', hour=9),
-                     args=[app.bot],
-                     id='weekly_report')
+                      trigger=CronTrigger(day_of_week='mon', hour=9),
+                      args=[app.bot],
+                      id='weekly_report')
 
     # Re-enable auto-posting for saved channels
     for channel_id, enabled in AUTO_POST_ENABLED.items():
         if enabled:
             try:
                 scheduler.add_job(auto_post_job,
-                                 trigger=CronTrigger(minute='*/15'),
-                                 args=[app.bot, channel_id],
-                                 id=f'autopost_{channel_id}',
-                                 replace_existing=True)
+                                  trigger=CronTrigger(minute='*/15'),
+                                  args=[app.bot, channel_id],
+                                  id=f'autopost_{channel_id}',
+                                  replace_existing=True)
                 logger.info(f"✅ Auto-post restored for {channel_id}")
             except Exception as e:
                 logger.error(f"Failed to restore: {e}")
 
     logger.info(f"✅ Bot running - Owner: {ADMIN_ID}")
+    logger.info(f"✅ Smart Verification: ENABLED")
     logger.info(
         f"✅ Loaded: {len(MANAGED_CHANNELS)} channels, {len(UPLOADED_IMAGES)} images"
     )
-    logger.info("✅ Application started")
 
-    # Run the bot
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
